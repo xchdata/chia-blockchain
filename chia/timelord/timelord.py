@@ -114,6 +114,7 @@ class Timelord:
         if not self.bluebox_mode:
             self.bluebox_mode = self.config.get("sanitizer_mode", False)
         self.pending_bluebox_info: List[Tuple[float, timelord_protocol.RequestCompactProofOfTime]] = []
+        self.wip_bluebox_info: Set[Tuple[uint32, uint8]] = set()  # height, field_vdf
         self.last_active_time = time.time()
         self.bluebox_pool: Optional[ProcessPoolExecutor] = None
 
@@ -880,6 +881,7 @@ class Timelord:
         proof_label: Optional[int] = None,
     ):
         disc: int = create_discriminant(challenge, self.constants.DISCRIMINANT_SIZE_BITS)
+        start_time = time.time()
 
         try:
             # Depending on the flags 'fast_algorithm' and 'bluebox_mode',
@@ -1033,6 +1035,13 @@ class Timelord:
         except ConnectionResetError as e:
             log.debug(f"Connection reset with VDF client {e}")
 
+        if self.bluebox_mode:
+            async with self.lock:
+                log.info(f"tag=bluebox_finish height={height} field_vdf={field_vdf} iterations={bluebox_iteration} duration={time.time() - start_time}")
+                assert height is not None
+                assert field_vdf is not None
+                self.wip_bluebox_info.discard((height, field_vdf))
+
     async def _manage_discriminant_queue_sanitizer(self):
         while not self._shut_down:
             async with self.lock:
@@ -1066,8 +1075,10 @@ class Timelord:
                                 )
                             )
                         )
+                        self.wip_bluebox_info.add((info[1].height, info[1].field_vdf))
                         self.pending_bluebox_info.remove(info)
                         self.free_clients = self.free_clients[1:]
+                        log.info(f"tag=bluebox_launch height={info[1].height} field_vdf={info[1].field_vdf} iterations={info[1].new_proof_of_time.number_of_iterations} pending={len(self.pending_bluebox_info)} wip={len(self.wip_bluebox_info)} free_clients={len(self.free_clients)}")
                 except Exception as e:
                     log.error(f"Exception manage discriminant queue: {e}")
             await asyncio.sleep(0.1)
