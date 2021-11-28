@@ -1359,8 +1359,8 @@ class FullNodeAPI:
         if self.full_node.sync_store.get_sync_mode():
             return None
 
-        if len(self.full_node.compact_vdf_sem._waiters) > 20:
-            self.log.debug(f"Ignoring NewCompactVDF: {request}, _waiters")
+        if len(self.full_node.compact_vdf_sem._waiters) > 200:
+            self.log.info(f"Ignoring NewCompactVDF: tag=ign_compact_vdf height={request.height} field_vdf={request.field_vdf} peer_host={peer.peer_host} waiters={len(self.full_node.compact_vdf_sem._waiters)}")
             return
 
         name = std_hash(request_bytes)
@@ -1373,7 +1373,9 @@ class FullNodeAPI:
         # new_compact_vdf() at a time, since it can be expensive
         async with self.full_node.compact_vdf_sem:
             try:
+                start_time = time.time()
                 await self.full_node.new_compact_vdf(request, peer)
+                self.log.info(f"Peer offered compact: tag=new_compact_vdf height={request.height} field_vdf={int(request.field_vdf)} peer_host={peer.peer_host} waiters={len(self.full_node.compact_vdf_sem._waiters)} duration={time.time() - start_time}")
             finally:
                 self.full_node.compact_vdf_requests.remove(name)
 
@@ -1383,7 +1385,9 @@ class FullNodeAPI:
     async def request_compact_vdf(self, request: full_node_protocol.RequestCompactVDF, peer: ws.WSChiaConnection):
         if self.full_node.sync_store.get_sync_mode():
             return None
+        start_time = time.time()
         await self.full_node.request_compact_vdf(request, peer)
+        self.log.info(f"Peer requested compact: tag=request_compact_vdf height={request.height} field_vdf={int(request.field_vdf)} peer_host={peer.peer_host} duration={time.time() - start_time}")
 
     @peer_required
     @api_request

@@ -2172,7 +2172,7 @@ class FullNode:
         """
         is_fully_compactified = await self.block_store.is_fully_compactified(header_hash)
         if is_fully_compactified is None or is_fully_compactified:
-            self.log.info(f"Already compactified block: {header_hash}. Ignoring.")
+            self.log.info(f"Already compactified block: height={height} field_vdf={field_vdf}")
             return False
         peak = self.blockchain.get_peak()
         if peak is None or peak.height - height < 5:
@@ -2260,7 +2260,7 @@ class FullNode:
         if not replaced:
             self.log.error(f"Could not replace compact proof: {request.height}")
             return None
-        self.log.info(f"Replaced compact proof at height {request.height}")
+        self.log.info(f"Replaced compact proof: height={request.height} field_vdf={request.field_vdf} proof_size={len(bytes(request.vdf_proof))}")
         msg = make_msg(
             ProtocolMessageTypes.new_compact_vdf,
             full_node_protocol.NewCompactVDF(request.height, request.header_hash, request.field_vdf, request.vdf_info),
@@ -2343,6 +2343,7 @@ class FullNode:
         if not replaced:
             self.log.error(f"Could not replace compact proof: {request.height}")
             return None
+        self.log.info(f"Received compact proof: height={request.height} field_vdf={request.field_vdf}")
         msg = make_msg(
             ProtocolMessageTypes.new_compact_vdf,
             full_node_protocol.NewCompactVDF(request.height, request.header_hash, request.field_vdf, request.vdf_info),
