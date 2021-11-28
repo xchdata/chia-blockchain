@@ -30,6 +30,7 @@ from chia.full_node.hint_store import HintStore
 from chia.full_node.mempool_manager import MempoolManager
 from chia.full_node.signage_point import SignagePoint
 from chia.full_node.sync_store import SyncStore
+from chia.full_node.uncompact_store import UncompactStore
 from chia.full_node.weight_proof import WeightProofHandler
 from chia.protocols import farmer_protocol, full_node_protocol, timelord_protocol, wallet_protocol
 from chia.protocols.full_node_protocol import (
@@ -79,6 +80,7 @@ class FullNode:
     full_node_peers: Optional[FullNodePeers]
     sync_store: Any
     coin_store: CoinStore
+    uncompact_store: UncompactStore
     mempool_manager: MempoolManager
     connection: aiosqlite.Connection
     _sync_task: Optional[asyncio.Task]
@@ -177,6 +179,7 @@ class FullNode:
         self.sync_store = await SyncStore.create()
         self.hint_store = await HintStore.create(self.db_wrapper)
         self.coin_store = await CoinStore.create(self.db_wrapper)
+        self.uncompact_store = await UncompactStore.create(self.db_wrapper)
         self.log.info("Initializing blockchain from disk")
         start_time = time.time()
         self.blockchain = await Blockchain.create(
@@ -2156,6 +2159,7 @@ class FullNode:
             self.log.error(f"Could not replace compact proof: {request.height}")
             return None
         self.log.info(f"Replaced compact proof: height={request.height} field_vdf={request.field_vdf} proof_size={len(bytes(request.vdf_proof))}")
+        await self.uncompact_store.remove_uncompact(request.header_hash, request.field_vdf)
         msg = make_msg(
             ProtocolMessageTypes.new_compact_vdf,
             full_node_protocol.NewCompactVDF(request.height, request.header_hash, request.field_vdf, request.vdf_info),
@@ -2239,6 +2243,7 @@ class FullNode:
             self.log.error(f"Could not replace compact proof: {request.height}")
             return None
         self.log.info(f"Received compact proof: height={request.height} field_vdf={request.field_vdf}")
+        await self.uncompact_store.remove_uncompact(request.header_hash, request.field_vdf)
         msg = make_msg(
             ProtocolMessageTypes.new_compact_vdf,
             full_node_protocol.NewCompactVDF(request.height, request.header_hash, request.field_vdf, request.vdf_info),
@@ -2256,14 +2261,18 @@ class FullNode:
                         return None
                     await asyncio.sleep(30)
 
-                broadcast_list: List[timelord_protocol.RequestCompactProofOfTime] = []
-
                 self.log.info("Getting random heights for bluebox to compact")
-                heights = await self.block_store.get_random_not_compactified(target_uncompact_proofs)
-                self.log.info("Heights found for bluebox to compact: [%s]" % ", ".join(map(str, heights)))
 
+                # Prune compactified blocks from uncompact.
+                start_time = time.time()
+                await self.uncompact_store.prune_fully_compactified_blocks()
+                self.log.info(f"Prune compact work items for fully compactified blocks: tag=uncompact_prune duration={time.time() - start_time}")
+
+                # Expand new non-compactified blocks and add to uncompact.
+                start_time = time.time()
+                heights = await self.uncompact_store.get_new_uncompact_heights(10 * target_uncompact_proofs)
+                new_requests: List[timelord_protocol.RequestCompactProofOfTime] = []
                 for h in heights:
-
                     headers = await self.blockchain.get_header_blocks_in_range(h, h, tx_filter=False)
                     records: Dict[bytes32, BlockRecord] = {}
                     if sanitize_weight_proof_only:
@@ -2280,7 +2289,7 @@ class FullNode:
                                 sub_slot.proofs.challenge_chain_slot_proof.witness_type > 0
                                 or not sub_slot.proofs.challenge_chain_slot_proof.normalized_to_identity
                             ):
-                                broadcast_list.append(
+                                new_requests.append(
                                     timelord_protocol.RequestCompactProofOfTime(
                                         sub_slot.challenge_chain.challenge_chain_end_of_slot_vdf,
                                         header.header_hash,
@@ -2293,7 +2302,7 @@ class FullNode:
                                 or not sub_slot.proofs.infused_challenge_chain_slot_proof.normalized_to_identity
                             ):
                                 assert sub_slot.infused_challenge_chain is not None
-                                broadcast_list.append(
+                                new_requests.append(
                                     timelord_protocol.RequestCompactProofOfTime(
                                         sub_slot.infused_challenge_chain.infused_challenge_chain_end_of_slot_vdf,
                                         header.header_hash,
@@ -2311,7 +2320,7 @@ class FullNode:
                             or not header.challenge_chain_sp_proof.normalized_to_identity
                         ):
                             assert header.reward_chain_block.challenge_chain_sp_vdf is not None
-                            broadcast_list.append(
+                            new_requests.append(
                                 timelord_protocol.RequestCompactProofOfTime(
                                     header.reward_chain_block.challenge_chain_sp_vdf,
                                     header.header_hash,
@@ -2324,7 +2333,7 @@ class FullNode:
                             header.challenge_chain_ip_proof.witness_type > 0
                             or not header.challenge_chain_ip_proof.normalized_to_identity
                         ):
-                            broadcast_list.append(
+                            new_requests.append(
                                 timelord_protocol.RequestCompactProofOfTime(
                                     header.reward_chain_block.challenge_chain_ip_vdf,
                                     header.header_hash,
@@ -2332,9 +2341,16 @@ class FullNode:
                                     uint8(CompressibleVDFField.CC_IP_VDF),
                                 )
                             )
+                self.log.info(f"Expanded compact work items for newly added blocks: items tag=uncompact_new heights={len(heights)} new_requests={len(new_requests)} duration={time.time() - start_time}")
+                if new_requests:
+                    start_time = time.time()
+                    await self.uncompact_store.add_uncompacts(new_requests)
+                    self.log.info(f"Persisted new compact work items: tag=uncompact_add duration={time.time() - start_time}")
 
-                if len(broadcast_list) > target_uncompact_proofs:
-                    broadcast_list = broadcast_list[:target_uncompact_proofs]
+                # Take a chunk of work to compact.
+                broadcast_list = await self.uncompact_store.get_uncompact_batch(target_uncompact_proofs)
+                self.log.info(f"Heights found for bluebox to compact: {len(broadcast_list)}")
+
                 if self.sync_store.get_sync_mode() or self.sync_store.get_long_sync():
                     continue
                 if self.server is not None:
