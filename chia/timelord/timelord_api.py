@@ -85,7 +85,12 @@ class TimelordAPI:
             # work older than 5s can safely be assumed to be from the previous batch, and needs to be cleared
             while self.timelord.pending_bluebox_info and (now - self.timelord.pending_bluebox_info[0][0] > 5):
                 del self.timelord.pending_bluebox_info[0]
-            if (vdf_info.height, vdf_info.field_vdf) not in self.timelord.wip_bluebox_info:
-                self.timelord.pending_bluebox_info.append((now, vdf_info))
-            else:
+            request_key = (vdf_info.height, vdf_info.field_vdf)
+            if request_key in self.timelord.wip_bluebox_info:
                 log.info(f"Ignore in-progress compact work item: tag=bluebox_ignwip height={vdf_info.height} field_vdf={vdf_info.field_vdf}")
+            elif request_key in self.timelord.done_bluebox_info:
+                log.info(f"Ignore recently finished compact work item: tag=bluebox_ignfin height={vdf_info.height} field_vdf={vdf_info.field_vdf}")
+            elif vdf_info in [vdf_info for (_, vdf_info) in self.timelord.pending_bluebox_info]:  # TODO uargh
+                log.info(f"Ignore duplicate compact work item: tag=bluebox_igndup height={vdf_info.height} field_vdf={vdf_info.field_vdf}")
+            else:
+                self.timelord.pending_bluebox_info.append((now, vdf_info))

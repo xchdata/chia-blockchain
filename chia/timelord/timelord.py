@@ -6,7 +6,8 @@ import random
 import time
 import traceback
 import os
-from typing import Callable, Dict, List, Optional, Tuple, Set
+from collections import deque
+from typing import Callable, Deque, Dict, List, Optional, Tuple, Set
 from chia.util.streamable import Streamable, streamable
 from chiavdf import create_discriminant, prove
 
@@ -115,6 +116,7 @@ class Timelord:
             self.bluebox_mode = self.config.get("sanitizer_mode", False)
         self.pending_bluebox_info: List[Tuple[float, timelord_protocol.RequestCompactProofOfTime]] = []
         self.wip_bluebox_info: Set[Tuple[uint32, uint8]] = set()  # height, field_vdf
+        self.done_bluebox_info: Deque[Tuple[uint32, uint8]] = deque(maxlen=100)  # TODO use something less arbitrary. maybe 10 * target_uncompact_proofs?
         self.last_active_time = time.time()
         self.bluebox_pool: Optional[ProcessPoolExecutor] = None
 
@@ -1030,6 +1032,9 @@ class Timelord:
                             vdf_info, vdf_proof, header_hash, height, field_vdf
                         )
                         if self.server is not None:
+                            # Keep track of the last 100 finished proofs, to
+                            # avoid racing for duplicate work.
+                            self.done_bluebox_info.append((height, field_vdf))
                             message = make_msg(ProtocolMessageTypes.respond_compact_proof_of_time, response)
                             await self.server.send_to_all([message], NodeType.FULL_NODE)
         except ConnectionResetError as e:
