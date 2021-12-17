@@ -1,10 +1,22 @@
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 import click
 
 from chia.util.config import load_config, save_config, str2bool
 from chia.util.default_root import DEFAULT_ROOT_PATH
+
+
+def set_path(config: Dict, path: str, value):
+    keys = path.split(".")
+    # TODO empty key
+    # TODO invalid key
+    node = config
+    for key in keys[:-1]:
+        if key not in node:
+            node[key] = {}
+        node = node[key]
+    node[keys[-1]] = value
 
 
 def configure(
@@ -19,6 +31,9 @@ def configure(
     set_peer_count: str,
     testnet: str,
     peer_connect_timeout: str,
+    set_str: Tuple[str, str],
+    set_int: Tuple[str, str],
+    set_bool: Tuple[str, str],
 ):
     config: Dict = load_config(DEFAULT_ROOT_PATH, "config.yaml")
     change_made = False
@@ -150,6 +165,18 @@ def configure(
         config["full_node"]["peer_connect_timeout"] = int(peer_connect_timeout)
         change_made = True
 
+    if set_str:
+        set_path(config, set_str[0], set_str[1])
+        change_made = True
+
+    if set_int:
+        set_path(config, set_int[0], int(set_int[1]))
+        change_made = True
+
+    if set_bool:
+        set_path(config, set_bool[0], str2bool(set_bool[1]))
+        change_made = True
+
     if change_made:
         print("Restart any running chia services for changes to take effect")
         save_config(root_path, "config.yaml", config)
@@ -196,6 +223,9 @@ def configure(
 )
 @click.option("--set-peer-count", help="Update the target peer count (default 80)", type=str)
 @click.option("--set-peer-connect-timeout", help="Update the peer connect timeout (default 30)", type=str)
+@click.option("--set-str", help="Set arbitrary string config value", type=str, nargs=2, metavar="NAME VALUE")
+@click.option("--set-int", help="Set arbitrary integer config value", type=str, nargs=2, metavar="NAME VALUE")
+@click.option("--set-bool", help="Set arbitrary boolean config value", type=str, nargs=2, metavar="NAME VALUE")
 @click.pass_context
 def configure_cmd(
     ctx,
@@ -209,6 +239,9 @@ def configure_cmd(
     set_peer_count,
     testnet,
     set_peer_connect_timeout,
+    set_str,
+    set_int,
+    set_bool,
 ):
     configure(
         ctx.obj["root_path"],
@@ -222,4 +255,7 @@ def configure_cmd(
         set_peer_count,
         testnet,
         set_peer_connect_timeout,
+        set_str,
+        set_int,
+        set_bool,
     )

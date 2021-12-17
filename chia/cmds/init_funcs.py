@@ -384,7 +384,7 @@ def chia_init(
         # This is reached if CHIA_ROOT is set, or if user has run chia init twice
         # before a new update.
         if testnet:
-            configure(root_path, "", "", "", "", "", "", "", "", testnet="true", peer_connect_timeout="")
+            configure(root_path, "", "", "", "", "", "", "", "", "true", "", None, None, None)
         if fix_ssl_permissions:
             fix_ssl(root_path)
         if should_check_keys:
@@ -394,7 +394,7 @@ def chia_init(
 
     create_default_chia_config(root_path)
     if testnet:
-        configure(root_path, "", "", "", "", "", "", "", "", testnet="true", peer_connect_timeout="")
+        configure(root_path, "", "", "", "", "", "", "", "", "true", "", None, None, None)
     create_all_ssl(root_path)
     if fix_ssl_permissions:
         fix_ssl(root_path)
