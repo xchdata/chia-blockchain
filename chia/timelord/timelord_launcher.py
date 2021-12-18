@@ -5,6 +5,8 @@ import re
 import signal
 import time
 import os
+from collections import OrderedDict
+from statistics import mean
 from typing import Dict, List, Optional
 
 import pkg_resources
@@ -17,10 +19,49 @@ from chia.util.setproctitle import setproctitle
 
 
 active_processes: List = []
+sent: Dict = OrderedDict()
+aborted: Dict = OrderedDict()
+
 stopped = False
 lock = asyncio.Lock()
+print_stats_task = None
 
 log = logging.getLogger(__name__)
+
+
+async def print_stats():
+    await asyncio.sleep(60)
+    while not stopped:
+        async with lock:
+            try:
+                current_hour = int(time.time() / 3600)
+
+                for h in list(sent.keys()):
+                    if (current_hour - h) > 24:
+                        del sent[h]
+
+                for h in list(aborted.keys()):
+                    if (current_hour - h) > 24:
+                        del aborted[h]
+
+                total_sent = sum(sent[h] for h in sent)
+                total_aborted = sum(aborted[h] for h in aborted)
+                average_sent = mean(sent[h] for h in sent if h != current_hour) if len(sent) > 1 else 0
+                current_sent = sent.get(current_hour, 0)
+                previous_sent = sent.get(current_hour - 1, 0)
+                log.info(
+                    f"VDF client statistics: tag=vdf_stats"
+                    f" sent={total_sent}"
+                    f" average_24h={average_sent:.0f}"
+                    f" current_hour={current_sent}"
+                    f" previous_hour={previous_sent}"
+                    f" aborted={total_aborted}"
+                )
+            except Exception as e:
+                log.warning(f"Exception while printing stats, aborting: {(e)}")
+                break
+        await asyncio.sleep(60)
+    log.info("Terminating stats printer")
 
 
 async def kill_processes():
@@ -33,6 +74,8 @@ async def kill_processes():
                 process.kill()
             except ProcessLookupError:
                 pass
+        if print_stats_task:
+            print_stats_task.cancel()
 
 
 def find_vdf_client() -> pathlib.Path:
@@ -70,7 +113,9 @@ async def spawn_process(host: str, port: int, counter: int, prefer_ipv6: Optiona
             active_processes.append(proc)
         stdout, stderr = await proc.communicate()
         end_time = time.time()
+        end_hour = int(end_time / 3600)
         seconds = end_time - launch_time
+        did_send = False
         if stderr:
             if first_10_seconds:
                 if time.time() - start_time > 10:
@@ -91,12 +136,19 @@ async def spawn_process(host: str, port: int, counter: int, prefer_ipv6: Optiona
                     f" iterations={iterations}"
                     f" kips={ips / 1000:.0f}"
                 )
+                did_send = True
             else:
                 log.info(f"VDF client aborted: tag=vdf_aborted counter={counter} duration={seconds:.2f}")
         log.info(f"Process number {counter} ended.")
         async with lock:
             if proc in active_processes:
                 active_processes.remove(proc)
+            if did_send:
+                sent[end_hour] = sent.get(end_hour, 0) + 1
+            else:
+                aborted[end_hour] = aborted.get(end_hour, 0) + 1
+            if start_time % 60 == 0:
+                print_stats()
         await asyncio.sleep(0.1)
 
 
@@ -113,9 +165,12 @@ async def spawn_all_processes(config: Dict, net_config: Dict):
 
 
 def main():
+    global print_stats_task
+
     if os.name == "nt":
         log.info("Timelord launcher not supported on Windows.")
         return
+
     root_path = DEFAULT_ROOT_PATH
     setproctitle("chia_timelord_launcher")
     net_config = load_config(root_path, "config.yaml")
@@ -134,6 +189,7 @@ def main():
         log.info("signal handlers unsupported")
 
     try:
+        print_stats_task = loop.create_task(print_stats())
         loop.run_until_complete(spawn_all_processes(config, net_config))
     finally:
         log.info("Launcher fully closed.")
