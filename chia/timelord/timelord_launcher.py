@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import pathlib
+import re
 import signal
 import socket
 import time
@@ -14,6 +15,7 @@ from chia.util.config import load_config
 from chia.util.default_root import DEFAULT_ROOT_PATH
 from chia.util.ints import uint16
 from chia.util.setproctitle import setproctitle
+
 
 active_processes: List = []
 stopped = False
@@ -56,6 +58,10 @@ async def spawn_process(host: str, port: int, counter: int):
                 resolved = host
             else:
                 resolved = socket.gethostbyname(host)
+            launch_time = time.time()
+            log.info(
+                f"Launching VDF client: tag=vdf_launch counter={counter} server_host={resolved} server_port={port}"
+            )
             proc = await asyncio.create_subprocess_shell(
                 f"{basename} {resolved} {port} {counter}",
                 stdout=asyncio.subprocess.PIPE,
@@ -68,14 +74,30 @@ async def spawn_process(host: str, port: int, counter: int):
         async with lock:
             active_processes.append(proc)
         stdout, stderr = await proc.communicate()
-        if stdout:
-            log.info(f"VDF client {counter}: {stdout.decode().rstrip()}")
+        end_time = time.time()
+        seconds = end_time - launch_time
         if stderr:
             if first_10_seconds:
                 if time.time() - start_time > 10:
                     first_10_seconds = False
             else:
                 log.error(f"VDF client {counter}: {stderr.decode().rstrip()}")
+        if stdout:
+            output = stdout.decode().rstrip()
+            log.info(f"VDF client {counter}: {output}")
+            if "VDF Client: Sent proof" in output:
+                md = re.search(r"VDF loop finished. Total iters: ([0-9]+)", output)
+                iterations = int(md.group(1)) if md else 0
+                ips = iterations / seconds
+                log.info(
+                    f"VDF client sent proof: tag=vdf_sent"
+                    f" counter={counter}"
+                    f" duration={seconds:.2f}"
+                    f" iterations={iterations}"
+                    f" kips={ips / 1000:.0f}"
+                )
+            else:
+                log.info(f"VDF client aborted: tag=vdf_aborted counter={counter} duration={seconds:.2f}")
         log.info(f"Process number {counter} ended.")
         async with lock:
             if proc in active_processes:
