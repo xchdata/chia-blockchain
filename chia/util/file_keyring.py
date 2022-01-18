@@ -164,7 +164,8 @@ class FileKeyring(FileSystemEventHandler):
         else:
             self.load_outer_payload()
 
-        self.setup_keyring_file_watcher()
+        ## Disabled to try getting it to work on a M1 in Docker.
+        #self.setup_keyring_file_watcher()
 
     def setup_keyring_file_watcher(self):
         observer = Observer()
