@@ -18,12 +18,18 @@ class UncompactStore:
         self.db_wrapper = db_wrapper
         async with self.db_wrapper.write_db() as db:
             await db.execute(
-                "CREATE TABLE IF NOT EXISTS uncompacts(header_hash blob NOT NULL,"
-                " field_vdf tinyint NOT NULL, height bigint, number_of_iterations bigint, request blob,"
+                "CREATE TABLE IF NOT EXISTS uncompacts("
+                " header_hash BLOB NOT NULL,"
+                " field_vdf TINYINT NOT NULL,"
+                " height BIGINT,"
+                " number_of_iterations BIGINT,"
+                " request BLOB,"
+                " enqueued DATE,"
                 " PRIMARY KEY (header_hash, field_vdf)"
                 ")"
             )
             await db.execute("CREATE INDEX IF NOT EXISTS uc_height on uncompacts(height)")
+            await db.execute("CREATE INDEX IF NOT EXISTS uc_height_enqueued on uncompacts(height, enqueued)")
         return self
 
     async def prune_fully_compactified_blocks(self) -> None:
@@ -53,6 +59,22 @@ class UncompactStore:
                 rows = await cursor.fetchall()
         return [row[0] for row in rows]
 
+    async def prune_enqueued(self, ttl: int) -> None:
+        async with self.db_wrapper.write_db() as db:
+            async with db.execute(f"""
+                UPDATE uncompacts SET enqueued = NULL
+                    WHERE enqueued IS NOT NULL AND strftime('%s') - enqueued > {ttl}
+            """) as cursor:
+                await cursor.fetchall()
+
+    async def mark_enqueued(self, header_hash: bytes, field_vdf: int) -> None:
+        async with self.db_wrapper.write_db() as db:
+            async with db.execute(f"""
+                UPDATE uncompacts SET enqueued = strftime('%s')
+                    WHERE header_hash = ? AND field_vdf = ?
+            """, (header_hash, field_vdf)) as cursor:
+                await cursor.fetchall()
+
     async def get_uncompact_batch(self, batch_size: int) -> List[RequestCompactProofOfTime]:
         async with self.db_wrapper.read_db() as db:
             async with db.execute(f"""
@@ -60,7 +82,7 @@ class UncompactStore:
                 docompact(yn) AS (
                     SELECT
                         CASE
-                            WHEN sum(is_fully_compactified)/cast(count() as float) > 0.91 THEN 0
+                            WHEN sum(is_fully_compactified)/cast(count() as float) > 1.00 THEN 0
                             ELSE 1
                         END yn
                         FROM full_blocks
@@ -68,6 +90,7 @@ class UncompactStore:
                 )
                 SELECT request
                     FROM uncompacts
+                    WHERE enqueued IS NULL
                     ORDER BY
                         height DESC
                     LIMIT
@@ -80,7 +103,8 @@ class UncompactStore:
     async def add_uncompacts(self, uncompacts_list: List[RequestCompactProofOfTime]) -> None:
         async with self.db_wrapper.write_db() as db:
             cursor = await db.executemany(
-                "INSERT INTO uncompacts VALUES(?, ?, ?, ?, ?)",
+                "INSERT INTO uncompacts(header_hash, field_vdf, height, number_of_iterations, request)"
+                " VALUES(?, ?, ?, ?, ?)",
                 [(request.header_hash,
                   request.field_vdf,
                   request.height,

@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import dataclasses
+import json
 import logging
 import multiprocessing
 from multiprocessing.context import BaseContext
@@ -8,9 +9,11 @@ import random
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import aiosqlite
+import boto3
+import botocore
 import sqlite3
 from blspy import AugSchemeMPL
 
@@ -127,7 +130,8 @@ class FullNode:
         self.sync_store = None
         self.signage_point_times = [time.time() for _ in range(self.constants.NUM_SPS_SUB_SLOT)]
         self.full_node_store = FullNodeStore(self.constants)
-        self.uncompact_task = None
+        self.send_uncompact_task = None
+        self.receive_compact_task = None
         self.compact_vdf_requests: Set[bytes32] = set()
         self.log = logging.getLogger(name if name else __name__)
 
@@ -150,6 +154,8 @@ class FullNode:
         self.peer_sub_counter: Dict[bytes32, int] = {}  # Peer ID: int (subscription count)
         mkdir(self.db_path.parent)
         self._transaction_queue_task = None
+
+        self.sqs = boto3.resource("sqs")
 
     def _set_state_changed_callback(self, callback: Callable):
         self.state_changed_callback = callback
@@ -292,13 +298,14 @@ class FullNode:
             if "sanitize_weight_proof_only" in self.config:
                 sanitize_weight_proof_only = self.config["sanitize_weight_proof_only"]
             assert self.config["target_uncompact_proofs"] != 0
-            self.uncompact_task = asyncio.create_task(
-                self.broadcast_uncompact_blocks(
+            self.send_uncompact_task = asyncio.create_task(
+                self.send_uncompact_parts(
                     self.config["send_uncompact_interval"],
                     self.config["target_uncompact_proofs"],
                     sanitize_weight_proof_only,
                 )
             )
+            self.receive_compact_task = asyncio.create_task(self.receive_compact_parts())
         self.initialized = True
         if self.full_node_peers is not None:
             asyncio.create_task(self.full_node_peers.start())
@@ -776,8 +783,10 @@ class FullNode:
 
         if self.full_node_peers is not None:
             asyncio.create_task(self.full_node_peers.close())
-        if self.uncompact_task is not None:
-            self.uncompact_task.cancel()
+        if self.send_uncompact_task is not None:
+            self.send_uncompact_task.cancel()
+        if self.receive_compact_task is not None:
+            self.receive_compact_task.cancel()
         if self._transaction_queue_task is not None:
             self._transaction_queue_task.cancel()
         if hasattr(self, "_blockchain_lock_queue"):
@@ -2356,119 +2365,162 @@ class FullNode:
         if self.server is not None:
             await self.server.send_to_all_except([msg], NodeType.FULL_NODE, peer.peer_node_id)
 
-    async def broadcast_uncompact_blocks(
-        self, uncompact_interval_scan: int, target_uncompact_proofs: int, sanitize_weight_proof_only: bool
+    async def expand_uncompact_height(self, height: uint32, sanitize_weight_proof_only: bool) -> AsyncGenerator[timelord_protocol.RequestCompactProofOfTime, None]:
+        headers = await self.blockchain.get_header_blocks_in_range(height, height, tx_filter=False)
+        records: Dict[bytes32, BlockRecord] = {}
+        if sanitize_weight_proof_only:
+            records = await self.blockchain.get_block_records_in_range(height, height)
+        for header in headers.values():
+            expected_header_hash = self.blockchain.height_to_hash(header.height)
+            if header.header_hash != expected_header_hash:
+                return
+            if sanitize_weight_proof_only:
+                assert header.header_hash in records
+                record = records[header.header_hash]
+            for sub_slot in header.finished_sub_slots:
+                if (
+                    sub_slot.proofs.challenge_chain_slot_proof.witness_type > 0
+                    or not sub_slot.proofs.challenge_chain_slot_proof.normalized_to_identity
+                ):
+                    yield timelord_protocol.RequestCompactProofOfTime(
+                        sub_slot.challenge_chain.challenge_chain_end_of_slot_vdf,
+                        header.header_hash,
+                        header.height,
+                        uint8(CompressibleVDFField.CC_EOS_VDF),
+                    )
+                if sub_slot.proofs.infused_challenge_chain_slot_proof is not None and (
+                    sub_slot.proofs.infused_challenge_chain_slot_proof.witness_type > 0
+                    or not sub_slot.proofs.infused_challenge_chain_slot_proof.normalized_to_identity
+                ):
+                    assert sub_slot.infused_challenge_chain is not None
+                    yield timelord_protocol.RequestCompactProofOfTime(
+                        sub_slot.infused_challenge_chain.infused_challenge_chain_end_of_slot_vdf,
+                        header.header_hash,
+                        header.height,
+                        uint8(CompressibleVDFField.ICC_EOS_VDF),
+                    )
+            # Running in 'sanitize_weight_proof_only' ignores CC_SP_VDF and CC_IP_VDF
+            # unless this is a challenge block.
+            if sanitize_weight_proof_only:
+                if not record.is_challenge_block(self.constants):
+                    return
+            if header.challenge_chain_sp_proof is not None and (
+                header.challenge_chain_sp_proof.witness_type > 0
+                or not header.challenge_chain_sp_proof.normalized_to_identity
+            ):
+                assert header.reward_chain_block.challenge_chain_sp_vdf is not None
+                yield timelord_protocol.RequestCompactProofOfTime(
+                    header.reward_chain_block.challenge_chain_sp_vdf,
+                    header.header_hash,
+                    header.height,
+                    uint8(CompressibleVDFField.CC_SP_VDF),
+                )
+            if (
+                header.challenge_chain_ip_proof.witness_type > 0
+                or not header.challenge_chain_ip_proof.normalized_to_identity
+            ):
+                yield timelord_protocol.RequestCompactProofOfTime(
+                    header.reward_chain_block.challenge_chain_ip_vdf,
+                    header.header_hash,
+                    header.height,
+                    uint8(CompressibleVDFField.CC_IP_VDF),
+                )
+
+    async def send_uncompact_parts(
+        self, send_uncompact_interval: int, target_uncompact_proofs: int, sanitize_weight_proof_only: bool
     ):
         try:
+            # Delay startup by 60 seconds, as only one purge is allowed per 60 seconds.
+
+            todo_queue = self.sqs.get_queue_by_name(QueueName="bluebox-todo.fifo")
+
             while not self._shut_down:
                 while self.sync_store.get_sync_mode() or self.sync_store.get_long_sync():
                     if self._shut_down:
                         return None
                     await asyncio.sleep(30)
 
-                self.log.info("Getting random heights for bluebox to compact")
+                self.log.info("Getting uncompact parts for bluebox to compact.")
 
                 # Prune compactified blocks from uncompact.
                 start_time = time.time()
                 await self.uncompact_store.prune_fully_compactified_blocks()
-                self.log.info(f"Prune compact work items for fully compactified blocks: tag=uncompact_prune duration={time.time() - start_time}")
+                self.log.info(f"Prune uncompact parts for fully compactified blocks: tag=uncompact_prune duration={time.time() - start_time}")
 
                 # Expand new non-compactified blocks and add to uncompact.
                 start_time = time.time()
-                heights = await self.uncompact_store.get_new_uncompact_heights(10 * target_uncompact_proofs)
-                new_requests: List[timelord_protocol.RequestCompactProofOfTime] = []
-                for h in heights:
-                    headers = await self.blockchain.get_header_blocks_in_range(h, h, tx_filter=False)
-                    records: Dict[bytes32, BlockRecord] = {}
-                    if sanitize_weight_proof_only:
-                        records = await self.blockchain.get_block_records_in_range(h, h)
-                    for header in headers.values():
-                        expected_header_hash = self.blockchain.height_to_hash(header.height)
-                        if header.header_hash != expected_header_hash:
-                            continue
-                        if sanitize_weight_proof_only:
-                            assert header.header_hash in records
-                            record = records[header.header_hash]
-                        for sub_slot in header.finished_sub_slots:
-                            if (
-                                sub_slot.proofs.challenge_chain_slot_proof.witness_type > 0
-                                or not sub_slot.proofs.challenge_chain_slot_proof.normalized_to_identity
-                            ):
-                                new_requests.append(
-                                    timelord_protocol.RequestCompactProofOfTime(
-                                        sub_slot.challenge_chain.challenge_chain_end_of_slot_vdf,
-                                        header.header_hash,
-                                        header.height,
-                                        uint8(CompressibleVDFField.CC_EOS_VDF),
-                                    )
-                                )
-                            if sub_slot.proofs.infused_challenge_chain_slot_proof is not None and (
-                                sub_slot.proofs.infused_challenge_chain_slot_proof.witness_type > 0
-                                or not sub_slot.proofs.infused_challenge_chain_slot_proof.normalized_to_identity
-                            ):
-                                assert sub_slot.infused_challenge_chain is not None
-                                new_requests.append(
-                                    timelord_protocol.RequestCompactProofOfTime(
-                                        sub_slot.infused_challenge_chain.infused_challenge_chain_end_of_slot_vdf,
-                                        header.header_hash,
-                                        header.height,
-                                        uint8(CompressibleVDFField.ICC_EOS_VDF),
-                                    )
-                                )
-                        # Running in 'sanitize_weight_proof_only' ignores CC_SP_VDF and CC_IP_VDF
-                        # unless this is a challenge block.
-                        if sanitize_weight_proof_only:
-                            if not record.is_challenge_block(self.constants):
-                                continue
-                        if header.challenge_chain_sp_proof is not None and (
-                            header.challenge_chain_sp_proof.witness_type > 0
-                            or not header.challenge_chain_sp_proof.normalized_to_identity
-                        ):
-                            assert header.reward_chain_block.challenge_chain_sp_vdf is not None
-                            new_requests.append(
-                                timelord_protocol.RequestCompactProofOfTime(
-                                    header.reward_chain_block.challenge_chain_sp_vdf,
-                                    header.header_hash,
-                                    header.height,
-                                    uint8(CompressibleVDFField.CC_SP_VDF),
-                                )
-                            )
-
-                        if (
-                            header.challenge_chain_ip_proof.witness_type > 0
-                            or not header.challenge_chain_ip_proof.normalized_to_identity
-                        ):
-                            new_requests.append(
-                                timelord_protocol.RequestCompactProofOfTime(
-                                    header.reward_chain_block.challenge_chain_ip_vdf,
-                                    header.header_hash,
-                                    header.height,
-                                    uint8(CompressibleVDFField.CC_IP_VDF),
-                                )
-                            )
-                self.log.info(f"Expanded compact work items for newly added blocks: items tag=uncompact_new heights={len(heights)} new_requests={len(new_requests)} duration={time.time() - start_time}")
+                new_heights = await self.uncompact_store.get_new_uncompact_heights(10 * target_uncompact_proofs)
+                new_requests = [r for h in new_heights async for r in self.expand_uncompact_height(h, sanitize_weight_proof_only)]
+                self.log.info(f"Expanded uncompact parts for newly added blocks: tag=uncompact_new new_heights={len(new_heights)} new_requests={len(new_requests)} duration={time.time() - start_time}")
                 if new_requests:
                     start_time = time.time()
                     await self.uncompact_store.add_uncompacts(new_requests)
-                    self.log.info(f"Persisted new compact work items: tag=uncompact_add duration={time.time() - start_time}")
-
-                # Take a chunk of work to compact.
-                broadcast_list = await self.uncompact_store.get_uncompact_batch(target_uncompact_proofs)
-                self.log.info(f"Heights found for bluebox to compact: {len(broadcast_list)}")
+                    self.log.info(f"Persisted new uncompact parts: tag=uncompact_add duration={time.time() - start_time}")
 
                 if self.sync_store.get_sync_mode() or self.sync_store.get_long_sync():
                     continue
-                if self.server is not None:
-                    self.log.info(f"Broadcasting {len(broadcast_list)} items to the bluebox")
-                    msgs = []
-                    for new_pot in broadcast_list:
-                        msg = make_msg(ProtocolMessageTypes.request_compact_proof_of_time, new_pot)
-                        msgs.append(msg)
-                    await self.server.send_to_all(msgs, NodeType.TIMELORD)
-                await asyncio.sleep(uncompact_interval_scan)
+
+                # Allow resending of compacts last sent >24 hours ago.
+                await self.uncompact_store.prune_enqueued(86400)
+
+                # Take a chunk of work to compact.
+                start_time = time.time()
+                todo_queue.reload()
+                missing_todos = max(0, target_uncompact_proofs - int(todo_queue.attributes['ApproximateNumberOfMessages']))
+                todo_requests = await self.uncompact_store.get_uncompact_batch(missing_todos)
+                for req in todo_requests:
+                    todo_response = todo_queue.send_message(
+                        MessageGroupId=f"{req.height}/{req.field_vdf}",
+                        MessageBody=json.dumps(req.to_json_dict())
+                    )
+                    await self.uncompact_store.mark_enqueued(req.header_hash, req.field_vdf)
+                self.log.info(f"Sent uncompact parts: tag=uncompact_send num_sent={missing_todos} duration={time.time() - start_time}")
+
+                await asyncio.sleep(send_uncompact_interval)
         except Exception as e:
             error_stack = traceback.format_exc()
-            self.log.error(f"Exception in broadcast_uncompact_blocks: {e}")
+            self.log.error(f"Exception in send_uncompact_parts: {e}")
+            self.log.error(f"Exception Stack: {error_stack}")
+
+    async def receive_compact_parts(self):
+        try:
+            done_queue = self.sqs.get_queue_by_name(QueueName="bluebox-done.fifo")
+
+            while not self._shut_down:
+                while self.sync_store.get_sync_mode() or self.sync_store.get_long_sync():
+                    if self._shut_down:
+                        return None
+                    await asyncio.sleep(30)
+
+                done_msgs = done_queue.receive_messages(WaitTimeSeconds=20,
+                                                        MessageAttributeNames=["Xchdata.*"],
+                                                        MaxNumberOfMessages=10)
+                for msg in done_msgs:
+                    json_msg = json.loads(msg.body)
+                    # We make this slightly more lenient, as to also be able to
+                    # process the dead-letter queue, if necessary.
+                    if "vdf_info" in json_msg:
+                        client_id_attr = msg.message_attributes.get("Xchdata.ClientId", {})
+                        client_id = client_id_attr.get("StringValue", "unknown")
+                        res = timelord_protocol.RespondCompactProofOfTime.from_json_dict(json_msg)
+                        self.log.info(f"Received compact part: tag=compact_receive height={res.height} field_vdf={res.field_vdf} iterations={res.vdf_info.number_of_iterations} client_id={client_id}")
+                        await self.respond_compact_proof_of_time(res)
+                        try:
+                            msg.delete()
+                            await asyncio.sleep(0.2)
+                        except botocore.exceptions.ClientError as error:
+                            self.log.warn(f"SQS error while deleting received compact. Backing off for 5 seconds: {error.response}")
+                            await asyncio.sleep(5)
+                            break
+
+                if not done_msgs:
+                    # If we didn't receive a message after waiting 20 seconds,
+                    # sleep a bit, to go easy on SQS API access.
+                    await asyncio.sleep(60)
+
+        except Exception as e:
+            error_stack = traceback.format_exc()
+            self.log.error(f"Exception in receive_compact_parts: {e}")
             self.log.error(f"Exception Stack: {error_stack}")
 
 
