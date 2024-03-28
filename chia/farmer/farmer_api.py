@@ -9,6 +9,7 @@ import aiohttp
 from chia_rs import AugSchemeMPL, G2Element, PrivateKey
 
 from chia import __version__
+from chia.consensus.pos_quality import UI_ACTUAL_SPACE_CONSTANT_FACTOR, _expected_plot_size
 from chia.consensus.pot_iterations import calculate_iterations_quality, calculate_sp_interval_iters
 from chia.farmer.farmer import Farmer, increment_pool_stats, strip_old_entries
 from chia.harvester.harvester_api import HarvesterAPI
@@ -363,7 +364,7 @@ class FarmerAPI:
                             ssl=ssl_context_for_root(get_mozilla_ca_crt(), log=self.farmer.log),
                             headers={
                                 "User-Agent": f"Chia Blockchain v.{__version__}",
-                                **self._get_additional_headers_for_partial(peer),
+                                **self._get_additional_headers_for_partial(peer, p2_singleton_puzzle_hash),
                             },
                         ) as resp:
                             if not resp.ok:
@@ -659,7 +660,9 @@ class FarmerAPI:
     async def plot_sync_done(self, message: PlotSyncDone, peer: WSChiaConnection) -> None:
         await self.farmer.plot_sync_receivers[peer.peer_node_id].sync_done(message)
 
-    def _get_additional_headers_for_partial(self, harvester_peer: WSChiaConnection) -> Dict[str, str]:
+    def _get_additional_headers_for_partial(
+        self, harvester_peer: WSChiaConnection, pool_contract_ph: bytes32
+    ) -> Dict[str, str]:
         headers: Dict[str, str] = {
             "x-farmer-peer-id": self.farmer.server.node_id.hex(),
             "x-farmer-version": __version__,
@@ -675,6 +678,9 @@ class FarmerAPI:
             "x-harvester-raw-capacity-bytes": f"{receiver.total_plot_size()}",
             "x-harvester-effective-capacity-bytes": f"{receiver.total_effective_plot_size()}",
             "x-harvester-plot-count": f"{len(receiver.plots())}",
+            "x-harvester-launcher-raw-capacity-bytes": f"{receiver.total_plot_size(pool_contract_ph)}",
+            "x-harvester-launcher-effective-capacity-bytes": f"{receiver.total_effective_plot_size(pool_contract_ph)}",
+            "x-harvester-launcher-plot-count": f"{len(receiver.plots(pool_contract_ph))}",
         }
 
     def _process_respond_signatures(

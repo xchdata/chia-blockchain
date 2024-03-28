@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Collection, Dict, List, Optional
 
@@ -80,11 +81,14 @@ class Receiver:
     _current_sync: Sync
     _last_sync: Sync
     _plots: Dict[str, Plot]
+    _plots_per_contract: Dict[bytes32, Dict[str, Plot]]
     _invalid: List[str]
     _keys_missing: List[str]
     _duplicates: List[str]
     _total_plot_size: int
     _total_effective_plot_size: int
+    _total_plot_size_per_contract: Dict[bytes32, int]
+    _total_effective_plot_size_per_contract: Dict[bytes32, int]
     _update_callback: ReceiverUpdateCallback
     _harvesting_mode: Optional[HarvestingMode]
 
@@ -97,11 +101,14 @@ class Receiver:
         self._current_sync = Sync()
         self._last_sync = Sync()
         self._plots = {}
+        self._plots_per_contract = {}
         self._invalid = []
         self._keys_missing = []
         self._duplicates = []
         self._total_plot_size = 0
         self._total_effective_plot_size = 0
+        self._total_plot_size_per_contract = {}
+        self._total_effective_plot_size_per_contract = {}
         self._update_callback = update_callback
         self._harvesting_mode = None
 
@@ -116,11 +123,14 @@ class Receiver:
         self._current_sync = Sync()
         self._last_sync = Sync()
         self._plots.clear()
+        self._plots_per_contract.clear()
         self._invalid.clear()
         self._keys_missing.clear()
         self._duplicates.clear()
         self._total_plot_size = 0
         self._total_effective_plot_size = 0
+        self._total_plot_size_per_contract.clear()
+        self._total_effective_plot_size_per_contract.clear()
         self._harvesting_mode = None
 
     def connection(self) -> WSChiaConnection:
@@ -135,7 +145,9 @@ class Receiver:
     def initial_sync(self) -> bool:
         return self._last_sync.sync_id == 0
 
-    def plots(self) -> Dict[str, Plot]:
+    def plots(self, pool_contract_puzzle_hash: Optional[bytes32] = None) -> Dict[str, Plot]:
+        if pool_contract_puzzle_hash is not None:
+            return self._plots_per_contract.get(pool_contract_puzzle_hash, {})
         return self._plots
 
     def invalid(self) -> List[str]:
@@ -147,10 +159,14 @@ class Receiver:
     def duplicates(self) -> List[str]:
         return self._duplicates
 
-    def total_plot_size(self) -> int:
+    def total_plot_size(self, pool_contract_puzzle_hash: Optional[bytes32] = None) -> int:
+        if pool_contract_puzzle_hash is not None:
+            return self._total_plot_size_per_contract.get(pool_contract_puzzle_hash, 0)
         return self._total_plot_size
 
-    def total_effective_plot_size(self) -> int:
+    def total_effective_plot_size(self, pool_contract_puzzle_hash: Optional[bytes32] = None) -> int:
+        if pool_contract_puzzle_hash is not None:
+            return self._total_effective_plot_size_per_contract.get(pool_contract_puzzle_hash, 0)
         return self._total_effective_plot_size
 
     def harvesting_mode(self) -> Optional[HarvestingMode]:
@@ -340,6 +356,12 @@ class Receiver:
         self._plots.update(self._current_sync.delta.valid.additions)
         for removal in self._current_sync.delta.valid.removals:
             del self._plots[removal]
+        for add_filename, add_plot in self._current_sync.delta.valid.additions.items():
+            if add_plot.pool_contract_puzzle_hash is not None:
+                self._plots_per_contract.setdefault(add_plot.pool_contract_puzzle_hash, {})[add_filename] = add_plot
+        for del_filename in self._current_sync.delta.valid.removals:
+            for pool_contract_puzzle_hash in self._plots_per_contract:
+                self._plots_per_contract.get(pool_contract_puzzle_hash, {}).pop(del_filename, None)
         self._invalid = self._current_sync.delta.invalid.additions.copy()
         self._keys_missing = self._current_sync.delta.keys_missing.additions.copy()
         self._duplicates = self._current_sync.delta.duplicates.additions.copy()
@@ -347,6 +369,19 @@ class Receiver:
         self._total_effective_plot_size = int(
             sum(UI_ACTUAL_SPACE_CONSTANT_FACTOR * int(_expected_plot_size(plot.size)) for plot in self._plots.values())
         )
+        for pool_contract_puzzle_hash, plots in self._plots_per_contract.items():
+            self._total_plot_size_per_contract[pool_contract_puzzle_hash] = sum(
+                plot.file_size for plot in plots.values()
+            )
+            self._total_effective_plot_size_per_contract[pool_contract_puzzle_hash] = int(
+                sum(UI_ACTUAL_SPACE_CONSTANT_FACTOR * int(_expected_plot_size(plot.size)) for plot in plots.values())
+            )
+        # TODO: purge empty pool_contract_phs?
+        # if len(plots) == 0:
+        #     del self._plots_per_contract[pool_contract_puzzle_hash]
+        #     self._total_plot_size_per_contract.pop(pool_contract_puzzle_hash, None)
+        #     self._total_effective_plot_size_per_contract.pop(pool_contract_puzzle_hash, None)
+
         # Save current sync as last sync and create a new current sync
         self._last_sync = self._current_sync
         self._current_sync = Sync()
